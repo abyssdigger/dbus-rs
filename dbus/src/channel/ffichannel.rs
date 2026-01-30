@@ -7,34 +7,14 @@ use std::os::raw::{c_int, c_void};
 use std::sync::{atomic::AtomicU8, atomic::Ordering, Mutex};
 use std::{collections::HashMap, str, time::Duration};
 
+/// Wrapper for [DBusConnection](ffi::DBusConnection) with Sync+Send implementation
 #[derive(Debug)]
-//struct ConnHandle(*mut ffi::DBusConnection, bool, bool);
-struct ConnHandle {
-    dbus_connection: *mut ffi::DBusConnection,
-    private_dbus_connection: bool,
+struct DbusConnHandle {
+    dbus: *mut ffi::DBusConnection,
 }
 
-unsafe impl Send for ConnHandle {}
-unsafe impl Sync for ConnHandle {}
-
-#[derive(Debug)]
-struct DBusConnSendSync {
-    dbus_connection: *mut ffi::DBusConnection,
-}
-
-unsafe impl Send for DBusConnSendSync {}
-unsafe impl Sync for DBusConnSendSync {}
-
-impl Drop for ConnHandle {
-    fn drop(&mut self) {
-        unsafe {
-            if self.private_dbus_connection {
-                ffi::dbus_connection_close(self.dbus_connection);
-            }
-            ffi::dbus_connection_unref(self.dbus_connection);
-        }
-    }
-}
+unsafe impl Send for DbusConnHandle {}
+unsafe impl Sync for DbusConnHandle {}
 
 #[derive(Debug, Eq, PartialEq, Hash)]
 struct WatchHandle(*mut ffi::DBusWatch);
@@ -45,7 +25,7 @@ unsafe impl Sync for WatchHandle {}
 /// This struct must be boxed as it is called from D-Bus callbacks!
 #[derive(Debug)]
 struct WatchMap {
-    conn: DBusConnSendSync,
+    conn: DbusConnHandle,
     list: Mutex<HashMap<WatchHandle, (Watch, bool)>>,
     current_rw: AtomicU8,
     current_fd: Option<WatchFd>,
@@ -65,7 +45,7 @@ fn calc_rw(list: &HashMap<WatchHandle, (Watch, bool)>) -> u8 {
 }
 
 impl WatchMap {
-    fn new(conn: DBusConnSendSync) -> Box<WatchMap> {
+    fn new(conn: DbusConnHandle) -> Box<WatchMap> {
         extern "C" fn add_watch_cb(watch: *mut ffi::DBusWatch, data: *mut c_void) -> u32 {
             unsafe {
                 let wm: &WatchMap = &*(data as *mut _);
@@ -93,7 +73,7 @@ impl WatchMap {
         let wptr: &WatchMap = &wm;
         if unsafe {
             ffi::dbus_connection_set_watch_functions(
-                wm.conn.dbus_connection,
+                wm.conn.dbus,
                 Some(add_watch_cb),
                 Some(remove_watch_cb),
                 Some(toggled_watch_cb),
@@ -126,10 +106,7 @@ impl WatchMap {
 impl Drop for WatchMap {
     fn drop(&mut self) {
         let wptr: &WatchMap = &self;
-        if unsafe {
-            ffi::dbus_connection_set_watch_functions(self.conn.dbus_connection, None, None, None, wptr as *const _ as *mut _, None)
-        } == 0
-        {
+        if unsafe { ffi::dbus_connection_set_watch_functions(self.conn.dbus, None, None, None, wptr as *const _ as *mut _, None) } == 0 {
             panic!("Cannot disable watch tracking (OOM?)")
         }
     }
@@ -149,29 +126,40 @@ impl Drop for WatchMap {
 /// blocking might occur due to an internal mutex inside the dbus library.
 #[derive(Debug)]
 pub struct Channel {
-    handle: ConnHandle,
+    //handle: ConnHandle,
+    dbus_conn: DbusConnHandle,
+    private: bool,
     watchmap: Option<Box<WatchMap>>,
 }
 
 impl Drop for Channel {
+    /// Cleans private [watchmap](WatchMap) and disconnects from dbus (channel can be created only with 
+    /// dbus connection created). Shared (non-private) connections must never be closed, only unrefed. 
+    /// See [DBus API / DBusConnection / dbus_connection_close()](https://dbus.freedesktop.org/doc/api/html/group__DBusConnection.html)
+    /// for details.
     fn drop(&mut self) {
-        self.set_watch_enabled(false); // Make sure "watchmap" is destroyed before "handle" is
+        self.set_watch_enabled(false); // Make sure "watchmap" is destroyed before dbus connection is closed
+        unsafe {
+            if self.private {
+                ffi::dbus_connection_close(self.dbus_conn.dbus);
+            }
+            ffi::dbus_connection_unref(self.dbus_conn.dbus);
+        }
     }
 }
 
 impl Channel {
     #[inline(always)]
     pub(crate) fn conn(&self) -> *mut ffi::DBusConnection {
-        self.handle.dbus_connection
+        self.dbus_conn.dbus
     }
 
     fn conn_from_ptr(ptr: *mut ffi::DBusConnection, private: bool) -> Result<Channel, Error> {
-        let handle = ConnHandle { dbus_connection: ptr, private_dbus_connection: private };
-
+        let dbus_conn = DbusConnHandle { dbus: ptr };
         /* No, we don't want our app to suddenly quit if dbus goes down */
         unsafe { ffi::dbus_connection_set_exit_on_disconnect(ptr, 0) };
 
-        let c = Channel { handle, watchmap: None };
+        let c = Channel { dbus_conn, private, watchmap: None };
 
         Ok(c)
     }
@@ -193,8 +181,15 @@ impl Channel {
         Self::conn_from_ptr(conn, true)
     }
 
-    /// Creates a new D-Bus connection.
+    /// Creates a new shared D-Bus connection.
     ///
+    /// If a connection to the given address already exists, dbus returns the existing connection
+    /// with its reference count incremented. Otherwise, it returns a new connection and saves
+    /// the new connection for possible re-use if a future call to dbus_connection_open()
+    /// asks to connect to the same server.
+    /// See [DBus API / DBusConnection / dbus_connection_open()](https://dbus.freedesktop.org/doc/api/html/group__DBusConnection.html)
+    /// for details.
+    /// 
     /// Blocking: until the connection is up and running.
     pub fn get_shared(bus: BusType) -> Result<Channel, Error> {
         let mut e = Error::empty();
@@ -224,13 +219,15 @@ impl Channel {
         Self::conn_from_ptr(conn, true)
     }
 
-    /// Creates a new D-Bus connection to a remote address.
-    /// If a connection to the given address already exists, returns the existing connection
-    /// with its reference count incremented. Otherwise, returns a new connection and saves
+    /// Creates a new shared D-Bus connection to a remote address.
+    /// If a connection to the given address already exists, dbus returns the existing connection
+    /// with its reference count incremented. Otherwise, it returns a new connection and saves
     /// the new connection for possible re-use if a future call to dbus_connection_open()
     /// asks to connect to the same server.
-    ///
-    /// Note: for all common cases (System / Session bus) you probably want "get_private" instead.
+    /// See [DBus API / DBusConnection / dbus_connection_open()](https://dbus.freedesktop.org/doc/api/html/group__DBusConnection.html)
+    /// for details.
+    /// 
+    /// Note: for all common cases (System / Session bus) you probably want "get_shared" instead.
     ///
     /// Blocking: until the connection is established.
     pub fn open_shared(address: &str) -> Result<Channel, Error> {
@@ -370,7 +367,7 @@ impl Channel {
         if enable == self.watchmap.is_some() {
             return;
         }
-        self.watchmap = if enable { Some(WatchMap::new(DBusConnSendSync { dbus_connection: self.conn() })) } else { None };
+        self.watchmap = if enable { Some(WatchMap::new(DbusConnHandle { dbus: self.conn() })) } else { None };
     }
 
     /// Gets the file descriptor to listen for read/write.
