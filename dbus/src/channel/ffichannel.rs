@@ -8,19 +8,24 @@ use std::sync::{atomic::AtomicU8, atomic::Ordering, Mutex};
 use std::{collections::HashMap, str, time::Duration};
 
 #[derive(Debug)]
-struct ConnHandle(*mut ffi::DBusConnection, bool, bool);
+//struct ConnHandle(*mut ffi::DBusConnection, bool, bool);
+struct ConnHandle {
+    dbus_connection: *mut ffi::DBusConnection,
+    disconnect_dbus_on_drop: bool,
+    private_dbus_connection: bool,
+}
 
 unsafe impl Send for ConnHandle {}
 unsafe impl Sync for ConnHandle {}
 
 impl Drop for ConnHandle {
     fn drop(&mut self) {
-        if self.1 {
+        if self.disconnect_dbus_on_drop {
             unsafe {
-                if self.2 {
-                    ffi::dbus_connection_close(self.0);
+                if self.private_dbus_connection {
+                    ffi::dbus_connection_close(self.dbus_connection);
                 }
-                ffi::dbus_connection_unref(self.0);
+                ffi::dbus_connection_unref(self.dbus_connection);
             }
         }
     }
@@ -83,7 +88,7 @@ impl WatchMap {
         let wptr: &WatchMap = &wm;
         if unsafe {
             ffi::dbus_connection_set_watch_functions(
-                wm.conn.0,
+                wm.conn.dbus_connection,
                 Some(add_watch_cb),
                 Some(remove_watch_cb),
                 Some(toggled_watch_cb),
@@ -116,7 +121,8 @@ impl WatchMap {
 impl Drop for WatchMap {
     fn drop(&mut self) {
         let wptr: &WatchMap = &self;
-        if unsafe { ffi::dbus_connection_set_watch_functions(self.conn.0, None, None, None, wptr as *const _ as *mut _, None) } == 0 {
+        if unsafe { ffi::dbus_connection_set_watch_functions(self.conn.dbus_connection, None, None, None, wptr as *const _ as *mut _, None) } == 0
+        {
             panic!("Cannot disable watch tracking (OOM?)")
         }
     }
@@ -149,11 +155,11 @@ impl Drop for Channel {
 impl Channel {
     #[inline(always)]
     pub(crate) fn conn(&self) -> *mut ffi::DBusConnection {
-        self.handle.0
+        self.handle.dbus_connection
     }
 
     fn conn_from_ptr(ptr: *mut ffi::DBusConnection, private: bool) -> Result<Channel, Error> {
-        let handle = ConnHandle(ptr, true, private);
+        let handle = ConnHandle { dbus_connection: ptr, disconnect_dbus_on_drop: true, private_dbus_connection: private };
 
         /* No, we don't want our app to suddenly quit if dbus goes down */
         unsafe { ffi::dbus_connection_set_exit_on_disconnect(ptr, 0) };
@@ -357,11 +363,11 @@ impl Channel {
         if enable == self.watchmap.is_some() {
             return;
         }
-        if enable {
-            self.watchmap = Some(WatchMap::new(ConnHandle(self.conn(), false, true)));
+        self.watchmap = if enable {
+            Some(WatchMap::new(ConnHandle { dbus_connection: self.conn(), disconnect_dbus_on_drop: false, private_dbus_connection: false }))
         } else {
-            self.watchmap = None;
-        }
+            None
+        };
     }
 
     /// Gets the file descriptor to listen for read/write.
