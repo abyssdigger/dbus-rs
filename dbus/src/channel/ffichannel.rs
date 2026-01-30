@@ -126,59 +126,78 @@ impl Drop for WatchMap {
 /// blocking might occur due to an internal mutex inside the dbus library.
 #[derive(Debug)]
 pub struct Channel {
-    //handle: ConnHandle,
-    dbus_conn: DbusConnHandle,
+    conn: DbusConnHandle,
     private: bool,
     watchmap: Option<Box<WatchMap>>,
 }
 
 impl Drop for Channel {
-    /// Cleans private [watchmap](WatchMap) and disconnects from dbus (channel can be created only with 
-    /// dbus connection created). Shared (non-private) connections must never be closed, only unrefed. 
+    /// Cleans private [watchmap](WatchMap) and disconnects from dbus (channel can be created only with
+    /// dbus connection created). Shared (non-private) connections must never be closed, only unrefed.
     /// See [DBus API / DBusConnection / dbus_connection_close()](https://dbus.freedesktop.org/doc/api/html/group__DBusConnection.html)
     /// for details.
     fn drop(&mut self) {
         self.set_watch_enabled(false); // Make sure "watchmap" is destroyed before dbus connection is closed
         unsafe {
             if self.private {
-                ffi::dbus_connection_close(self.dbus_conn.dbus);
+                ffi::dbus_connection_close(self.conn.dbus);
             }
-            ffi::dbus_connection_unref(self.dbus_conn.dbus);
+            ffi::dbus_connection_unref(self.conn.dbus);
         }
     }
+}
+
+// Helper type for any type of dbus connections (local or external)
+pub enum BusTypeAdv<'a> {
+    Local(&'a BusType),
+    Extern(&'a str),
 }
 
 impl Channel {
     #[inline(always)]
     pub(crate) fn conn(&self) -> *mut ffi::DBusConnection {
-        self.dbus_conn.dbus
+        self.conn.dbus
     }
 
     fn conn_from_ptr(ptr: *mut ffi::DBusConnection, private: bool) -> Result<Channel, Error> {
-        let dbus_conn = DbusConnHandle { dbus: ptr };
         /* No, we don't want our app to suddenly quit if dbus goes down */
         unsafe { ffi::dbus_connection_set_exit_on_disconnect(ptr, 0) };
+        Ok(Channel { conn: DbusConnHandle { dbus: ptr }, private, watchmap: None })
+    }
 
-        let c = Channel { dbus_conn, private, watchmap: None };
-
-        Ok(c)
+    #[inline]
+    /// Creates a new D-Bus connection - local or external, private or shared
+    /// (helper to prevent code repetition and to have all connection options in one place)
+    pub fn get_dbus_conn(bustype: BusTypeAdv, private: bool) -> Result<Channel, Error> {
+        let mut e = Error::empty();
+        let conn:*mut ffi::DBusConnection = match bustype {
+            BusTypeAdv::Local(bus) => {
+                let b = match bus {
+                    BusType::Session => ffi::DBusBusType::Session,
+                    BusType::System => ffi::DBusBusType::System,
+                    BusType::Starter => ffi::DBusBusType::Starter,
+                };
+                match private {
+                    true => unsafe { ffi::dbus_bus_get_private(b, e.get_mut()) },
+                    false => unsafe { ffi::dbus_bus_get(b, e.get_mut()) },
+                }
+            }
+            BusTypeAdv::Extern(address) => match private {
+                true => unsafe { ffi::dbus_connection_open_private(to_c_str(address).as_ptr(), e.get_mut()) },
+                false => unsafe { ffi::dbus_connection_open(to_c_str(address).as_ptr(), e.get_mut()) },
+            },
+        };
+        if conn.is_null() {
+            return Err(e);
+        }
+        Self::conn_from_ptr(conn, private)
     }
 
     /// Creates a new D-Bus connection.
     ///
     /// Blocking: until the connection is up and running.
     pub fn get_private(bus: BusType) -> Result<Channel, Error> {
-        let mut e = Error::empty();
-        let b = match bus {
-            BusType::Session => ffi::DBusBusType::Session,
-            BusType::System => ffi::DBusBusType::System,
-            BusType::Starter => ffi::DBusBusType::Starter,
-        };
-        let conn = unsafe { ffi::dbus_bus_get_private(b, e.get_mut()) };
-        if conn.is_null() {
-            return Err(e);
-        }
-        Self::conn_from_ptr(conn, true)
+        Self::get_dbus_conn(BusTypeAdv::Local(&bus), true)
     }
 
     /// Creates a new shared D-Bus connection.
@@ -189,20 +208,10 @@ impl Channel {
     /// asks to connect to the same server.
     /// See [DBus API / DBusConnection / dbus_connection_open()](https://dbus.freedesktop.org/doc/api/html/group__DBusConnection.html)
     /// for details.
-    /// 
+    ///
     /// Blocking: until the connection is up and running.
     pub fn get_shared(bus: BusType) -> Result<Channel, Error> {
-        let mut e = Error::empty();
-        let b = match bus {
-            BusType::Session => ffi::DBusBusType::Session,
-            BusType::System => ffi::DBusBusType::System,
-            BusType::Starter => ffi::DBusBusType::Starter,
-        };
-        let conn = unsafe { ffi::dbus_bus_get(b, e.get_mut()) };
-        if conn.is_null() {
-            return Err(e);
-        }
-        Self::conn_from_ptr(conn, false)
+        Self::get_dbus_conn(BusTypeAdv::Local(&bus), false)
     }
 
     /// Creates a new D-Bus connection to a remote address.
@@ -211,12 +220,7 @@ impl Channel {
     ///
     /// Blocking: until the connection is established.
     pub fn open_private(address: &str) -> Result<Channel, Error> {
-        let mut e = Error::empty();
-        let conn = unsafe { ffi::dbus_connection_open_private(to_c_str(address).as_ptr(), e.get_mut()) };
-        if conn.is_null() {
-            return Err(e);
-        }
-        Self::conn_from_ptr(conn, true)
+        Self::get_dbus_conn(BusTypeAdv::Extern(address), true)
     }
 
     /// Creates a new shared D-Bus connection to a remote address.
@@ -226,17 +230,12 @@ impl Channel {
     /// asks to connect to the same server.
     /// See [DBus API / DBusConnection / dbus_connection_open()](https://dbus.freedesktop.org/doc/api/html/group__DBusConnection.html)
     /// for details.
-    /// 
+    ///
     /// Note: for all common cases (System / Session bus) you probably want "get_shared" instead.
     ///
     /// Blocking: until the connection is established.
     pub fn open_shared(address: &str) -> Result<Channel, Error> {
-        let mut e = Error::empty();
-        let conn = unsafe { ffi::dbus_connection_open(to_c_str(address).as_ptr(), e.get_mut()) };
-        if conn.is_null() {
-            return Err(e);
-        }
-        Self::conn_from_ptr(conn, false)
+        Self::get_dbus_conn(BusTypeAdv::Extern(address), false)
     }
 
     /// Registers a new D-Bus connection with the bus.
