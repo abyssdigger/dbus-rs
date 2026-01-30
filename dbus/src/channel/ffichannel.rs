@@ -11,22 +11,27 @@ use std::{collections::HashMap, str, time::Duration};
 //struct ConnHandle(*mut ffi::DBusConnection, bool, bool);
 struct ConnHandle {
     dbus_connection: *mut ffi::DBusConnection,
-    disconnect_dbus_on_drop: bool,
     private_dbus_connection: bool,
 }
 
 unsafe impl Send for ConnHandle {}
 unsafe impl Sync for ConnHandle {}
 
+#[derive(Debug)]
+struct DBusConnSendSync {
+    dbus_connection: *mut ffi::DBusConnection,
+}
+
+unsafe impl Send for DBusConnSendSync {}
+unsafe impl Sync for DBusConnSendSync {}
+
 impl Drop for ConnHandle {
     fn drop(&mut self) {
-        if self.disconnect_dbus_on_drop {
-            unsafe {
-                if self.private_dbus_connection {
-                    ffi::dbus_connection_close(self.dbus_connection);
-                }
-                ffi::dbus_connection_unref(self.dbus_connection);
+        unsafe {
+            if self.private_dbus_connection {
+                ffi::dbus_connection_close(self.dbus_connection);
             }
+            ffi::dbus_connection_unref(self.dbus_connection);
         }
     }
 }
@@ -40,7 +45,7 @@ unsafe impl Sync for WatchHandle {}
 /// This struct must be boxed as it is called from D-Bus callbacks!
 #[derive(Debug)]
 struct WatchMap {
-    conn: ConnHandle,
+    conn: DBusConnSendSync,
     list: Mutex<HashMap<WatchHandle, (Watch, bool)>>,
     current_rw: AtomicU8,
     current_fd: Option<WatchFd>,
@@ -60,7 +65,7 @@ fn calc_rw(list: &HashMap<WatchHandle, (Watch, bool)>) -> u8 {
 }
 
 impl WatchMap {
-    fn new(conn: ConnHandle) -> Box<WatchMap> {
+    fn new(conn: DBusConnSendSync) -> Box<WatchMap> {
         extern "C" fn add_watch_cb(watch: *mut ffi::DBusWatch, data: *mut c_void) -> u32 {
             unsafe {
                 let wm: &WatchMap = &*(data as *mut _);
@@ -121,7 +126,9 @@ impl WatchMap {
 impl Drop for WatchMap {
     fn drop(&mut self) {
         let wptr: &WatchMap = &self;
-        if unsafe { ffi::dbus_connection_set_watch_functions(self.conn.dbus_connection, None, None, None, wptr as *const _ as *mut _, None) } == 0
+        if unsafe {
+            ffi::dbus_connection_set_watch_functions(self.conn.dbus_connection, None, None, None, wptr as *const _ as *mut _, None)
+        } == 0
         {
             panic!("Cannot disable watch tracking (OOM?)")
         }
@@ -159,7 +166,7 @@ impl Channel {
     }
 
     fn conn_from_ptr(ptr: *mut ffi::DBusConnection, private: bool) -> Result<Channel, Error> {
-        let handle = ConnHandle { dbus_connection: ptr, disconnect_dbus_on_drop: true, private_dbus_connection: private };
+        let handle = ConnHandle { dbus_connection: ptr, private_dbus_connection: private };
 
         /* No, we don't want our app to suddenly quit if dbus goes down */
         unsafe { ffi::dbus_connection_set_exit_on_disconnect(ptr, 0) };
@@ -363,11 +370,7 @@ impl Channel {
         if enable == self.watchmap.is_some() {
             return;
         }
-        self.watchmap = if enable {
-            Some(WatchMap::new(ConnHandle { dbus_connection: self.conn(), disconnect_dbus_on_drop: false, private_dbus_connection: false }))
-        } else {
-            None
-        };
+        self.watchmap = if enable { Some(WatchMap::new(DBusConnSendSync { dbus_connection: self.conn() })) } else { None };
     }
 
     /// Gets the file descriptor to listen for read/write.
