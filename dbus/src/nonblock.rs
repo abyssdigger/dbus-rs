@@ -12,6 +12,7 @@
 //! (Although you can also just call read_write and process_all at regular intervals, and possibly
 //! set a timeout handler.)
 
+#![allow(mismatched_lifetime_syntaxes)]
 
 use crate::{Error, Message};
 use crate::channel::{MatchingReceiver, Channel, Sender, Token};

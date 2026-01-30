@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+#![allow(mismatched_lifetime_syntaxes)]
 
 #[cfg(target_endian="little")]
 const IS_BIG_ENDIAN: bool = false;

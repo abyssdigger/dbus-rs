@@ -1,3 +1,5 @@
+#![allow(mismatched_lifetime_syntaxes)]
+
 use dbus::blocking::stdintf::org_freedesktop_dbus::EmitsChangedSignal;
 use std::future::Future;
 use std::marker::PhantomData;

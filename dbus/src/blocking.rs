@@ -1,5 +1,6 @@
 //! Connections and proxies that make blocking method calls.
 
+#![allow(mismatched_lifetime_syntaxes)]
 
 use crate::strings::{BusName, Path, Interface, Member};
 use crate::arg::{AppendAll, ReadAll, IterAppend};
@@ -132,12 +133,130 @@ pub struct SyncConnection {
 
 use crate::blocking::stdintf::org_freedesktop_dbus;
 
+/***************************************************************************************/
+
+/// A testing connection to D-Bus, non-async version where callbacks are Send but not Sync.
+pub struct TestConnection {
+    channel: Channel,
+    filters: RefCell<Filters<TestFilterCb>>,
+    all_signal_matches: AtomicBool,
+}
+
+type
+    TestFilterCb = Box<dyn FnMut(Message, &TestConnection) -> bool + Send + 'static>;
+
+impl TestConnection {
+    fn filters_mut(&self) -> std::cell::RefMut<Filters<TestFilterCb>> { self.filters.borrow_mut() }
+}
+
+impl TestConnection {
+    /// Create a new connection to the session bus.
+    pub fn new_session() -> Result<Self, Error> {
+        let c = Channel::get_private(BusType::Session);
+        let c1 = c.map(From::from);
+        c1
+    }
+
+    /// Tries to handle an incoming message if there is one. If there isn't one,
+    /// it will wait up to timeout
+    ///
+    /// This method only takes "&self" instead of "&mut self", but it is a logic error to call
+    /// it recursively and might lead to panics or deadlocks.
+    ///
+    /// Returns true when there was a message to process, and false when time out reached.
+    pub fn process(&self, timeout: Duration) -> Result<bool, Error> {
+        if let Some(msg) = self.channel.blocking_pop_message(timeout)? {
+            if self.all_signal_matches.load(Ordering::Acquire) && msg.msg_type() == MessageType::Signal {
+                // If it's a signal and the mode is enabled, send a copy of the message to all
+                // matching filters.
+                let matching_filters = self.filters_mut().remove_all_matching(&msg);
+                // `matching_filters` needs to be a separate variable and not inlined here, because
+                // if it's inline then the `MutexGuard` will live too long and we'll get a deadlock
+                // on the next call to `filters_mut()` below.
+                for mut ff in matching_filters {
+                    if let Ok(copy) = msg.duplicate() {
+                        if ff.2(copy, self) {
+                            self.filters_mut().insert(ff);
+                        }
+                    } else {
+                        // Silently drop the message, but add the filter back.
+                        self.filters_mut().insert(ff);
+                    }
+                }
+            } else {
+                // Otherwise, send the original message to only the first matching filter.
+                let ff = self.filters_mut().remove_first_matching(&msg);
+                if let Some(mut ff) = ff {
+                    if ff.2(msg, self) {
+                        self.filters_mut().insert(ff);
+                    }
+                } else if let Some(reply) = crate::channel::default_reply(&msg) {
+                    let _ = self.channel.send(reply);
+                }
+            }
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }    
+
+    /// The channel for this connection
+    pub fn channel(&self) -> &Channel {
+        &self.channel
+    }
+}
+
+impl BlockingSender for TestConnection {
+    fn send_with_reply_and_block(&self, msg: Message, timeout: Duration) -> Result<Message, Error> {
+        self.channel.send_with_reply_and_block(msg, timeout)
+    }
+}
+
+impl From<Channel> for TestConnection {
+    fn from(channel: Channel) -> TestConnection { TestConnection {
+        channel,
+        filters: Default::default(),
+        all_signal_matches: AtomicBool::new(false),
+    } }
+}
+
+impl channel::Sender for TestConnection {
+    fn send(&self, msg: Message) -> Result<u32, ()> { self.channel.send(msg) }
+}
+
+impl<S: ReadAll, F: FnMut(S, &TestConnection, &Message) -> bool + Send + 'static> MakeSignal<TestFilterCb, S, TestConnection> for F {
+    fn make(mut self, mstr: String) -> TestFilterCb {
+        Box::new(move |msg: Message, conn: &TestConnection| {
+            if let Ok(s) = S::read(&mut msg.iter_init()) {
+                if self(s, conn, &msg) { return true };
+                let proxy = stdintf::proxy(conn);
+                use crate::blocking::stdintf::org_freedesktop::DBus;
+                let _ = proxy.remove_match(&mstr);
+                false
+            } else { true }
+        })
+    }
+}
+
+impl channel::MatchingReceiver for TestConnection {
+    type F = TestFilterCb;
+    fn start_receive(&self, m: MatchRule<'static>, f: Self::F) -> Token {
+        self.filters_mut().add(m, f)
+    }
+    fn stop_receive(&self, id: Token) -> Option<(MatchRule<'static>, Self::F)> {
+        self.filters_mut().remove(id)
+    }
+}
+
+/***************************************************************************************/
+
+
+
 macro_rules! connimpl {
      ($c: ident, $cb: ident $(, $ss:tt)*) =>  {
 
 type
     $cb = Box<dyn FnMut(Message, &$c) -> bool $(+ $ss)* + 'static>;
-
 
 impl $c {
 

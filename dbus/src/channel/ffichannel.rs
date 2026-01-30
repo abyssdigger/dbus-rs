@@ -1,24 +1,28 @@
 //! Contains some helper structs and traits common to all Connection types.-
 
-use crate::{Error, Message, to_c_str};
-use std::{str, time::Duration, collections::HashMap};
-use std::sync::{Mutex, atomic::AtomicU8, atomic::Ordering};
-use std::ffi::CStr;
-use std::os::raw::{c_void, c_int};
 use super::{BusType, Watch, WatchFd};
+use crate::{to_c_str, Error, Message};
+use std::ffi::CStr;
+use std::os::raw::{c_int, c_void};
+use std::sync::{atomic::AtomicU8, atomic::Ordering, Mutex};
+use std::{collections::HashMap, str, time::Duration};
 
 #[derive(Debug)]
-struct ConnHandle(*mut ffi::DBusConnection, bool);
+struct ConnHandle(*mut ffi::DBusConnection, bool, bool);
 
 unsafe impl Send for ConnHandle {}
 unsafe impl Sync for ConnHandle {}
 
 impl Drop for ConnHandle {
     fn drop(&mut self) {
-        if self.1 { unsafe {
-            ffi::dbus_connection_close(self.0);
-            ffi::dbus_connection_unref(self.0);
-        }}
+        if self.1 {
+            unsafe {
+                if self.2 {
+                    ffi::dbus_connection_close(self.0);
+                }
+                ffi::dbus_connection_unref(self.0);
+            }
+        }
     }
 }
 
@@ -40,38 +44,55 @@ struct WatchMap {
 fn calc_rw(list: &HashMap<WatchHandle, (Watch, bool)>) -> u8 {
     let mut r = 0;
     for (w, b) in list.values() {
-        if *b && w.read { r |= 1; }
-        if *b && w.write { r |= 2; }
+        if *b && w.read {
+            r |= 1;
+        }
+        if *b && w.write {
+            r |= 2;
+        }
     }
     r
 }
 
 impl WatchMap {
     fn new(conn: ConnHandle) -> Box<WatchMap> {
-        extern "C" fn add_watch_cb(watch: *mut ffi::DBusWatch, data: *mut c_void) -> u32 { unsafe {
-            let wm: &WatchMap = &*(data as *mut _);
-            wm.list.lock().unwrap().insert(WatchHandle(watch), Watch::from_raw_enabled(watch));
-            1
-        }}
-        extern "C" fn remove_watch_cb(watch: *mut ffi::DBusWatch, data: *mut c_void) { unsafe {
-            let wm: &WatchMap = &*(data as *mut _);
-            wm.list.lock().unwrap().remove(&WatchHandle(watch));
-        }}
-        extern "C" fn toggled_watch_cb(watch: *mut ffi::DBusWatch, data: *mut c_void) { unsafe {
-            let wm: &WatchMap = &*(data as *mut _);
-            let mut list = wm.list.lock().unwrap();
-            let (_, ref mut b) = list.get_mut(&WatchHandle(watch)).unwrap();
-            *b = ffi::dbus_watch_get_enabled(watch) != 0;
-            wm.current_rw.store(calc_rw(&list), Ordering::Release);
-        }}
+        extern "C" fn add_watch_cb(watch: *mut ffi::DBusWatch, data: *mut c_void) -> u32 {
+            unsafe {
+                let wm: &WatchMap = &*(data as *mut _);
+                wm.list.lock().unwrap().insert(WatchHandle(watch), Watch::from_raw_enabled(watch));
+                1
+            }
+        }
+        extern "C" fn remove_watch_cb(watch: *mut ffi::DBusWatch, data: *mut c_void) {
+            unsafe {
+                let wm: &WatchMap = &*(data as *mut _);
+                wm.list.lock().unwrap().remove(&WatchHandle(watch));
+            }
+        }
+        extern "C" fn toggled_watch_cb(watch: *mut ffi::DBusWatch, data: *mut c_void) {
+            unsafe {
+                let wm: &WatchMap = &*(data as *mut _);
+                let mut list = wm.list.lock().unwrap();
+                let (_, ref mut b) = list.get_mut(&WatchHandle(watch)).unwrap();
+                *b = ffi::dbus_watch_get_enabled(watch) != 0;
+                wm.current_rw.store(calc_rw(&list), Ordering::Release);
+            }
+        }
 
-        let mut wm = Box::new(WatchMap {
-            conn, list: Default::default(), current_rw: Default::default(), current_fd: None
-        });
+        let mut wm = Box::new(WatchMap { conn, list: Default::default(), current_rw: Default::default(), current_fd: None });
         let wptr: &WatchMap = &wm;
-        if unsafe { ffi::dbus_connection_set_watch_functions(wm.conn.0,
-            Some(add_watch_cb), Some(remove_watch_cb), Some(toggled_watch_cb), wptr as *const _ as *mut _, None) } == 0 {
-                panic!("Cannot enable watch tracking (OOM?)")
+        if unsafe {
+            ffi::dbus_connection_set_watch_functions(
+                wm.conn.0,
+                Some(add_watch_cb),
+                Some(remove_watch_cb),
+                Some(toggled_watch_cb),
+                wptr as *const _ as *mut _,
+                None,
+            )
+        } == 0
+        {
+            panic!("Cannot enable watch tracking (OOM?)")
         }
 
         {
@@ -95,9 +116,8 @@ impl WatchMap {
 impl Drop for WatchMap {
     fn drop(&mut self) {
         let wptr: &WatchMap = &self;
-        if unsafe { ffi::dbus_connection_set_watch_functions(self.conn.0,
-            None, None, None, wptr as *const _ as *mut _, None) } == 0 {
-                panic!("Cannot disable watch tracking (OOM?)")
+        if unsafe { ffi::dbus_connection_set_watch_functions(self.conn.0, None, None, None, wptr as *const _ as *mut _, None) } == 0 {
+            panic!("Cannot disable watch tracking (OOM?)")
         }
     }
 }
@@ -128,12 +148,12 @@ impl Drop for Channel {
 
 impl Channel {
     #[inline(always)]
-    pub (crate) fn conn(&self) -> *mut ffi::DBusConnection {
+    pub(crate) fn conn(&self) -> *mut ffi::DBusConnection {
         self.handle.0
     }
 
-    fn conn_from_ptr(ptr: *mut ffi::DBusConnection) -> Result<Channel, Error> {
-        let handle = ConnHandle(ptr, true);
+    fn conn_from_ptr(ptr: *mut ffi::DBusConnection, private: bool) -> Result<Channel, Error> {
+        let handle = ConnHandle(ptr, true, private);
 
         /* No, we don't want our app to suddenly quit if dbus goes down */
         unsafe { ffi::dbus_connection_set_exit_on_disconnect(ptr, 0) };
@@ -142,7 +162,6 @@ impl Channel {
 
         Ok(c)
     }
-
 
     /// Creates a new D-Bus connection.
     ///
@@ -156,9 +175,26 @@ impl Channel {
         };
         let conn = unsafe { ffi::dbus_bus_get_private(b, e.get_mut()) };
         if conn.is_null() {
-            return Err(e)
+            return Err(e);
         }
-        Self::conn_from_ptr(conn)
+        Self::conn_from_ptr(conn, true)
+    }
+
+    /// Creates a new D-Bus connection.
+    ///
+    /// Blocking: until the connection is up and running.
+    pub fn get_shared(bus: BusType) -> Result<Channel, Error> {
+        let mut e = Error::empty();
+        let b = match bus {
+            BusType::Session => ffi::DBusBusType::Session,
+            BusType::System => ffi::DBusBusType::System,
+            BusType::Starter => ffi::DBusBusType::Starter,
+        };
+        let conn = unsafe { ffi::dbus_bus_get(b, e.get_mut()) };
+        if conn.is_null() {
+            return Err(e);
+        }
+        Self::conn_from_ptr(conn, false)
     }
 
     /// Creates a new D-Bus connection to a remote address.
@@ -170,9 +206,27 @@ impl Channel {
         let mut e = Error::empty();
         let conn = unsafe { ffi::dbus_connection_open_private(to_c_str(address).as_ptr(), e.get_mut()) };
         if conn.is_null() {
-            return Err(e)
+            return Err(e);
         }
-        Self::conn_from_ptr(conn)
+        Self::conn_from_ptr(conn, true)
+    }
+
+    /// Creates a new D-Bus connection to a remote address.
+    /// If a connection to the given address already exists, returns the existing connection
+    /// with its reference count incremented. Otherwise, returns a new connection and saves
+    /// the new connection for possible re-use if a future call to dbus_connection_open()
+    /// asks to connect to the same server.
+    ///
+    /// Note: for all common cases (System / Session bus) you probably want "get_private" instead.
+    ///
+    /// Blocking: until the connection is established.
+    pub fn open_shared(address: &str) -> Result<Channel, Error> {
+        let mut e = Error::empty();
+        let conn = unsafe { ffi::dbus_connection_open(to_c_str(address).as_ptr(), e.get_mut()) };
+        if conn.is_null() {
+            return Err(e);
+        }
+        Self::conn_from_ptr(conn, false)
     }
 
     /// Registers a new D-Bus connection with the bus.
@@ -200,11 +254,12 @@ impl Channel {
     /// It's usually something like ":1.54"
     pub fn unique_name(&self) -> Option<&str> {
         let c = unsafe { ffi::dbus_bus_get_unique_name(self.conn()) };
-        if c.is_null() { return None; }
+        if c.is_null() {
+            return None;
+        }
         let s = unsafe { CStr::from_ptr(c) };
         str::from_utf8(s.to_bytes()).ok()
     }
-
 
     /// Puts a message into libdbus out queue, and tries to send it.
     ///
@@ -216,7 +271,9 @@ impl Channel {
     pub fn send(&self, msg: Message) -> Result<u32, ()> {
         let mut serial = 0u32;
         let r = unsafe { ffi::dbus_connection_send(self.conn(), msg.ptr(), &mut serial) };
-        if r == 0 { return Err(()); }
+        if r == 0 {
+            return Err(());
+        }
         Ok(serial)
     }
 
@@ -230,10 +287,8 @@ impl Channel {
     /// they might race to retrieve the reply message from the internal queue.
     pub fn send_with_reply_and_block(&self, msg: Message, timeout: Duration) -> Result<Message, Error> {
         let mut e = Error::empty();
-        let response = unsafe {
-            ffi::dbus_connection_send_with_reply_and_block(self.conn(), msg.ptr(),
-                timeout.as_millis() as c_int, e.get_mut())
-        };
+        let response =
+            unsafe { ffi::dbus_connection_send_with_reply_and_block(self.conn(), msg.ptr(), timeout.as_millis() as c_int, e.get_mut()) };
         if response.is_null() {
             return Err(e);
         }
@@ -243,7 +298,9 @@ impl Channel {
     /// Flush the queue of outgoing messages.
     ///
     /// Blocking: until the outgoing queue is empty.
-    pub fn flush(&self) { unsafe { ffi::dbus_connection_flush(self.conn()) } }
+    pub fn flush(&self) {
+        unsafe { ffi::dbus_connection_flush(self.conn()) }
+    }
 
     /// Read and write to the connection.
     ///
@@ -284,10 +341,10 @@ impl Channel {
     /// Removes a message from the incoming queue, or waits until timeout if the queue is empty.
     ///
     pub fn blocking_pop_message(&self, timeout: Duration) -> Result<Option<Message>, Error> {
-        if let Some(msg) = self.pop_message() { return Ok(Some(msg)) }
-        self.read_write(Some(timeout)).map_err(|_|
-            Error::new_failed("Failed to read/write data, disconnected from D-Bus?")
-        )?;
+        if let Some(msg) = self.pop_message() {
+            return Ok(Some(msg));
+        }
+        self.read_write(Some(timeout)).map_err(|_| Error::new_failed("Failed to read/write data, disconnected from D-Bus?"))?;
         Ok(self.pop_message())
     }
 
@@ -297,9 +354,11 @@ impl Channel {
     /// something else than one file descriptor,
     /// but this should be extremely unlikely to ever happen.)
     pub fn set_watch_enabled(&mut self, enable: bool) {
-        if enable == self.watchmap.is_some() { return }
+        if enable == self.watchmap.is_some() {
+            return;
+        }
         if enable {
-            self.watchmap = Some(WatchMap::new(ConnHandle(self.conn(), false)));
+            self.watchmap = Some(WatchMap::new(ConnHandle(self.conn(), false, true)));
         } else {
             self.watchmap = None;
         }
@@ -315,11 +374,7 @@ impl Channel {
     pub fn watch(&self) -> Watch {
         let wm = self.watchmap.as_ref().unwrap();
         let rw = wm.current_rw.load(Ordering::Acquire);
-        Watch {
-            fd: wm.current_fd.unwrap(),
-            read: (rw & 1) != 0,
-            write: (rw & 2) != 0,
-        }
+        Watch { fd: wm.current_fd.unwrap(), read: (rw & 1) != 0, write: (rw & 2) != 0 }
     }
 
     /// Get an up-to-date list of file descriptors to watch.
@@ -329,31 +384,33 @@ impl Channel {
     pub fn watch_fds(&mut self) -> Result<Vec<Watch>, ()> {
         let en = self.watchmap.is_some();
         self.set_watch_enabled(true);
-        let mut wlist: Vec<Watch> = self.watchmap.as_ref().unwrap().list.lock().unwrap().values()
+        let mut wlist: Vec<Watch> = self
+            .watchmap
+            .as_ref()
+            .unwrap()
+            .list
+            .lock()
+            .unwrap()
+            .values()
             .map(|&(w, b)| Watch { fd: w.fd, read: b && w.read, write: b && w.write })
             .collect();
         self.set_watch_enabled(en);
 
         if wlist.len() == 2 && wlist[0].fd == wlist[1].fd {
             // This is always true in practice, see https://lists.freedesktop.org/archives/dbus/2019-July/017786.html
-            wlist = vec!(Watch {
-                fd: wlist[0].fd,
-                read: wlist[0].read || wlist[1].read,
-                write: wlist[0].write || wlist[1].write
-            });
+            wlist = vec![Watch { fd: wlist[0].fd, read: wlist[0].read || wlist[1].read, write: wlist[0].write || wlist[1].write }];
         }
 
         Ok(wlist)
     }
 }
 
-
 impl Watch {
     unsafe fn from_raw_enabled(watch: *mut ffi::DBusWatch) -> (Self, bool) {
         #[cfg(unix)]
-        let mut w = Watch {fd: ffi::dbus_watch_get_unix_fd(watch), read: false, write: false};
+        let mut w = Watch { fd: ffi::dbus_watch_get_unix_fd(watch), read: false, write: false };
         #[cfg(windows)]
-        let mut w = Watch {fd: ffi::dbus_watch_get_socket(watch) as WatchFd, read: false, write: false};
+        let mut w = Watch { fd: ffi::dbus_watch_get_socket(watch) as WatchFd, read: false, write: false };
         let enabled = ffi::dbus_watch_get_enabled(watch) != 0;
         let flags = ffi::dbus_watch_get_flags(watch);
         use std::os::raw::c_uint;

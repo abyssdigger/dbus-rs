@@ -1,5 +1,7 @@
 //! Contains structs and traits closely related to D-Bus messages.
 
+#![allow(mismatched_lifetime_syntaxes)]
+
 use std::{fmt, ptr};
 use super::{ffi, Error, libc, init_dbus};
 use crate::strings::{BusName, Path, Interface, Member, ErrorName};

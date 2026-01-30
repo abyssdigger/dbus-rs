@@ -1,5 +1,7 @@
 //! Contains structs and traits relevant to the connection itself, and dispatching incoming messages.
 
+#![allow(mismatched_lifetime_syntaxes)]
+
 use crate::{Error, Message, MessageType, c_str_to_slice, channel::WatchFd, ffi, to_c_str};
 use crate::ffidisp::ConnPath;
 use std::{fmt, mem, ptr, thread, panic, ops};
