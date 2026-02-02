@@ -148,7 +148,7 @@ impl Drop for Channel {
 }
 
 // Helper type for any type of dbus connections (local or external)
-pub enum BusTypeAdv<'a> {
+pub enum DBusConnType<'a> {
     Local(&'a BusType),
     Extern(&'a str),
 }
@@ -165,13 +165,12 @@ impl Channel {
         Ok(Channel { conn: DbusConnHandle { dbus: ptr }, private, watchmap: None })
     }
 
-    #[inline]
     /// Creates a new D-Bus connection - local or external, private or shared
     /// (helper to prevent code repetition and to have all connection options in one place)
-    pub fn get_dbus_conn(bustype: BusTypeAdv, private: bool) -> Result<Channel, Error> {
+    pub fn get_dbus_conn(conntype: DBusConnType, private: bool) -> Result<Channel, Error> {
         let mut e = Error::empty();
-        let conn:*mut ffi::DBusConnection = match bustype {
-            BusTypeAdv::Local(bus) => {
+        let conn:*mut ffi::DBusConnection = match conntype {
+            DBusConnType::Local(bus) => {
                 let b = match bus {
                     BusType::Session => ffi::DBusBusType::Session,
                     BusType::System => ffi::DBusBusType::System,
@@ -182,7 +181,7 @@ impl Channel {
                     false => unsafe { ffi::dbus_bus_get(b, e.get_mut()) },
                 }
             }
-            BusTypeAdv::Extern(address) => match private {
+            DBusConnType::Extern(address) => match private {
                 true => unsafe { ffi::dbus_connection_open_private(to_c_str(address).as_ptr(), e.get_mut()) },
                 false => unsafe { ffi::dbus_connection_open(to_c_str(address).as_ptr(), e.get_mut()) },
             },
@@ -196,8 +195,9 @@ impl Channel {
     /// Creates a new D-Bus connection.
     ///
     /// Blocking: until the connection is up and running.
+    #[inline(always)]
     pub fn get_private(bus: BusType) -> Result<Channel, Error> {
-        Self::get_dbus_conn(BusTypeAdv::Local(&bus), true)
+        Self::get_dbus_conn(DBusConnType::Local(&bus), true)
     }
 
     /// Creates a new shared D-Bus connection.
@@ -210,8 +210,9 @@ impl Channel {
     /// for details.
     ///
     /// Blocking: until the connection is up and running.
+    #[inline(always)]
     pub fn get_shared(bus: BusType) -> Result<Channel, Error> {
-        Self::get_dbus_conn(BusTypeAdv::Local(&bus), false)
+        Self::get_dbus_conn(DBusConnType::Local(&bus), false)
     }
 
     /// Creates a new D-Bus connection to a remote address.
@@ -219,8 +220,9 @@ impl Channel {
     /// Note: for all common cases (System / Session bus) you probably want "get_private" instead.
     ///
     /// Blocking: until the connection is established.
+    #[inline(always)]
     pub fn open_private(address: &str) -> Result<Channel, Error> {
-        Self::get_dbus_conn(BusTypeAdv::Extern(address), true)
+        Self::get_dbus_conn(DBusConnType::Extern(address), true)
     }
 
     /// Creates a new shared D-Bus connection to a remote address.
@@ -234,8 +236,9 @@ impl Channel {
     /// Note: for all common cases (System / Session bus) you probably want "get_shared" instead.
     ///
     /// Blocking: until the connection is established.
+    #[inline(always)]
     pub fn open_shared(address: &str) -> Result<Channel, Error> {
-        Self::get_dbus_conn(BusTypeAdv::Extern(address), false)
+        Self::get_dbus_conn(DBusConnType::Extern(address), false)
     }
 
     /// Registers a new D-Bus connection with the bus.
