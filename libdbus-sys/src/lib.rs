@@ -167,6 +167,7 @@ pub struct DBusObjectPathVTable {
 
 extern "C" {
     pub fn dbus_bus_get_private(t: DBusBusType, error: *mut DBusError) -> *mut DBusConnection;
+    pub fn dbus_bus_get(t: DBusBusType, error: *mut DBusError) -> *mut DBusConnection;
     pub fn dbus_bus_get_unique_name(conn: *mut DBusConnection) -> *const c_char;
     pub fn dbus_bus_request_name(conn: *mut DBusConnection, name: *const c_char,
         flags: c_uint, error: *mut DBusError) -> c_int;
@@ -182,6 +183,7 @@ extern "C" {
     pub fn dbus_connection_dispatch(conn: *mut DBusConnection) -> DBusDispatchStatus;
     pub fn dbus_connection_flush(conn: *mut DBusConnection);
     pub fn dbus_connection_open_private(address: *const c_char, error: *mut DBusError) -> *mut DBusConnection;
+    pub fn dbus_connection_open(address: *const c_char, error: *mut DBusError) -> *mut DBusConnection;
     pub fn dbus_connection_unref(conn: *mut DBusConnection);
     pub fn dbus_connection_get_is_connected(conn: *mut DBusConnection) -> u32;
     pub fn dbus_connection_set_exit_on_disconnect(conn: *mut DBusConnection, enable: u32);
